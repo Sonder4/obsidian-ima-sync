@@ -7,6 +7,12 @@
 - **下行（ima → vault）**：按用户勾选的知识库定时同步，镜像子文件夹结构；网页/微信文章转 Markdown（DOMParser 实现），Markdown/TXT 原样保留，PDF/Word/PPT 等存入附件目录并生成带链接的存根笔记；frontmatter 记录 `ima_media_id` / `ima_kb_id` / 标签等
 - **上行（vault → ima）**：映射 vault 文件夹 → 知识库，新 Markdown 自动 `create_media → COS 签名上传 → add_knowledge`（media_type=7）；重名检查、内容哈希变更检测
 - **真更新（可选）**：在设置中粘贴自己的 ima.qq.com 网页会话 Cookie 后，已上传文件的修改自动「删除旧版 + 原名重传」，不再产生副本。能力严格限定于插件自己上传的文档；留空则完全关闭、行为与官方 API 一致。原理与风险见 [docs/ima-internals.md](docs/ima-internals.md)
+- **知识库管理（可选，同需 Cookie）**：基于客户端同款内部接口实现——
+  - 标签：编辑本文标签（带知识库已有标签联想）、重命名/删除知识库标签
+  - 修改：重命名本文在 ima 中的标题；用本文内容替换 ima 原文（replace_knowledge）
+  - 结构：在知识库中新建文件夹、新建知识库
+  - 跨库复制：把本文复制到其他知识库
+  - 以上均以命令形式提供（命令面板搜 "ima"），作用于当前打开的、带 `ima_media_id` frontmatter 的笔记
 - **个人笔记下行**（可选）：`list_note` + `get_doc_content`，按 `modify_time` 增量
 - **安全边界**：删除不双向传播；来自 ima 的文件默认不回传（防回环）；官方 API 无更新/删除端点，未启用真更新时已上传文件的修改默认跳过并提示
 

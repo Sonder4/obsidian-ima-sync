@@ -21,13 +21,17 @@
 | `import_urls` | ✅ | 导入网页 |
 | `del_knowledge` | ❌ | **删除条目**，body: `{knowledge_base_id, media_ids: []}` |
 | `delete_knowledge_base` | ❌ | 删除整个知识库 |
-| `replace_knowledge` | ❌ | 替换条目内容 |
-| `rename_knowledge` | ❌ | 重命名 |
-| `update_tags` / `batch_update_tags` / `del_tags` / `rename_tag` | ❌ | 标签管理 |
-| `create_knowledge_base` / `create_folder` / `set_knowledge_top` / `set_knowledge_base_top` | ❌ | 结构管理 |
-| `copy_knowledge` / `cancel_cross_kb_op` | ❌ | 跨库复制 |
-| `update_basic_info` / `update_knowledge_access_status` / `update_permission_info` | ❌ | 信息/权限 |
-| `import_notes` / `parse_knowledge` / `get_user_space` | ❌ | 其他 |
+| `replace_knowledge` | ❌ | **替换条目内容**：`{knowledge_base_id, origin_media_id, replace_info: {media_id, media_type, file_info: {content_type, cos_key, file_name, file_size}}}`（新文件需先走 create_media + COS） |
+| `rename_knowledge` | ❌ | 重命名：`{knowledge_base_id, media_id, title, folder_id?, media_type?}` |
+| `get_tags` / `search_tags` | ❌ | 标签列表（返回 `tagInfos`）/ 搜索（`{knowledge_base_id, query, cursor, limit}`） |
+| `update_tags` | ❌ | 设置条目标签：`{knowledge_base_id, media_id, tags: []}` |
+| `batch_update_tags` | ❌ | 批量设置：`{knowledge_base_id, media_ids: [], tags}`，返回 `results[media_id].retCode` |
+| `del_tags` | ❌ | 删除标签：`{knowledge_base_id, tags: []}` |
+| `rename_tag` | ❌ | 重命名标签：`{knowledge_base_id, origin_tag, new_tag}` |
+| `copy_knowledge` | ❌ | **跨库复制**：`{media_ids: [], dst_knowledge_base_id, dst_folder_id?}`；异步任务可经 SSE `knowledge_tab_sse/resume_cross_kb_op` 轮询，`cancel_cross_kb_op {task_id}` 取消 |
+| `create_knowledge_base` / `create_folder` / `set_knowledge_top` / `set_knowledge_base_top` | ❌ | 结构管理；`create_folder`: `{knowledge_base_id, folder_id(父，根目录=知识库ID), title}`；`set_knowledge_top`: `{knowledge_base_id, folder_id, media_id, is_top}` |
+| `update_basic_info` / `update_knowledge_access_status` / `update_permission_info` | ❌ | 信息/权限（update_basic_info: `{name, description, cover?}`） |
+| `import_notes` / `parse_knowledge` / `get_user_space` / `report_knowledge` | ❌ | 其他 |
 
 另有非 knowledge 前缀：`/cgi-bin/file_manager/get_media`、`/cgi-bin/media_logic/parse_media` 等。
 

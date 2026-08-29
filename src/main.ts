@@ -4,6 +4,7 @@ import { DownSync, type SyncSummary } from "./down";
 import { UpSync } from "./up";
 import { DEFAULT_SETTINGS, type ImaSyncSettings } from "./settings";
 import { ImaSettingTab } from "./settingsTab";
+import { registerImaManageCommands } from "./commands";
 
 export default class ImaSyncPlugin extends Plugin {
 	settings: ImaSyncSettings = DEFAULT_SETTINGS;
@@ -38,6 +39,8 @@ export default class ImaSyncPlugin extends Plugin {
 			name: "立即上行同步（vault → ima）",
 			callback: () => this.runSync("up"),
 		});
+
+		registerImaManageCommands(this);
 
 		this.armAutoSync();
 	}

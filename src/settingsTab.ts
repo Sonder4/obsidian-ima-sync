@@ -276,20 +276,10 @@ export class ImaSettingTab extends PluginSettingTab {
 					btn.setDisabled(true).setButtonText("测试中…");
 					try {
 						const { ImaCgiClient } = await import("./cgi");
-						const cgi = new ImaCgiClient(s.webCookie);
-						// 用一个必然不存在的 media_id 探测：端点与鉴权正常时会返回业务错误（如"不存在"），
-						// 会话失效则返回登录错误。都不会产生实际删除。
-						try {
-							await cgi.delKnowledge("probe_kb_id", ["probe_media_id"]);
-							new Notice("网页会话有效（探测请求返回正常）");
-						} catch (err) {
-							const msg = err instanceof Error ? err.message : String(err);
-							if (/登录|login|auth|权限|ticket|cookie/i.test(msg)) {
-								new Notice(`Cookie 无效或已过期：${msg}`, 8000);
-							} else {
-								new Notice(`接口可达（探测返回业务错误：${msg}）`, 8000);
-							}
-						}
+						const result = await new ImaCgiClient(s.webCookie).probe();
+						new Notice(result.ok ? `✅ ${result.message}` : `❌ ${result.message}`, 8000);
+					} catch (err) {
+						new Notice(`测试失败：${err instanceof Error ? err.message : String(err)}`, 8000);
 					} finally {
 						btn.setDisabled(false).setButtonText("测试");
 					}
