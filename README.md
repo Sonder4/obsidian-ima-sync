@@ -1,40 +1,54 @@
 # obsidian-ima-sync
 
-腾讯 ima 知识库 ↔ Obsidian 双向同步插件。基于 ima 官方 OpenAPI（[ima skill](https://app-dl.ima.qq.com/skills/ima-skills-1.1.9.zip) 内置文档）开发。
+腾讯 ima 知识库 ↔ Obsidian 双向同步插件。双通道设计：**官方 OpenAPI**（稳定读取/下行）+ **客户端原生 CGI 接口**（可选，解锁删除/改名/标签/跨库复制等管理能力，基于 ima 桌面端 5.8.6 扩展逆向与真实流量实测，见 [docs/ima-internals.md](docs/ima-internals.md)）。
 
-## 功能
+## 功能总览
 
-- **下行（ima → vault）**：按用户勾选的知识库定时同步，镜像子文件夹结构；网页/微信文章转 Markdown（DOMParser 实现），Markdown/TXT 原样保留，PDF/Word/PPT 等存入附件目录并生成带链接的存根笔记；frontmatter 记录 `ima_media_id` / `ima_kb_id` / 标签等
-- **上行（vault → ima）**：映射 vault 文件夹 → 知识库，新 Markdown 自动 `create_media → COS 签名上传 → add_knowledge`（media_type=7）；重名检查、内容哈希变更检测
-- **真更新（可选）**：在设置中粘贴自己的 ima.qq.com 网页会话 Cookie 后，已上传文件的修改自动「删除旧版 + 原名重传」，不再产生副本。能力严格限定于插件自己上传的文档；留空则完全关闭、行为与官方 API 一致。原理与风险见 [docs/ima-internals.md](docs/ima-internals.md)
-- **知识库管理（可选，同需 Cookie）**：基于客户端同款内部接口实现——
-  - 标签：编辑本文标签（带知识库已有标签联想）、重命名/删除知识库标签
-  - 修改：重命名本文在 ima 中的标题；用本文内容替换 ima 原文（replace_knowledge）
-  - 结构：在知识库中新建文件夹、新建知识库
-  - 跨库复制：把本文复制到其他知识库
-  - 以上均以命令形式提供（命令面板搜 "ima"），作用于当前打开的、带 `ima_media_id` frontmatter 的笔记
-- **个人笔记下行**（可选）：`list_note` + `get_doc_content`，按 `modify_time` 增量
-- **安全边界**：删除不双向传播；来自 ima 的文件默认不回传（防回环）；官方 API 无更新/删除端点，未启用真更新时已上传文件的修改默认跳过并提示
+| 模块 | 方向 | 认证 | 说明 |
+| --- | --- | --- | --- |
+| 知识库下行 | ima → vault | OpenAPI | 按勾选的知识库增量同步，镜像子文件夹；网页转 Markdown；PDF/Word 等附件本地化 + 存根笔记 |
+| 笔记下行（可选） | ima → vault | OpenAPI | ima 个人笔记只读同步，按 modify_time 增量 |
+| 笔记上行 | vault → ima | OpenAPI 或 CGI | 映射 vault 文件夹 → 知识库；配置 Cookie 后自动走内部通道（上传物可管理） |
+| 真更新（可选） | vault → ima | CGI | 已上传文件的修改 = 删除旧版 + 原名重传，无副本残留 |
+| 知识库管理（可选） | 双向操作 | CGI | 标签编辑/管理、重命名、内容替换、新建文件夹/知识库、跨库复制、删除 |
 
-## 构建
+**所有可选能力以 Cookie 为开关**：设置中粘贴 ima.qq.com 会话 Cookie 即激活；留空 = 纯官方 API 行为。
+
+## 快速开始
+
+1. **构建**：`npm install && npm run build`（产物 `main.js` 拷入 vault 的 `.obsidian/plugins/obsidian-ima-sync/`）
+2. **凭证**：设置 → IMA Sync → 粘贴 Client ID + API Key（[获取入口](https://ima.qq.com/agent-interface)）→ 点「验证并刷新知识库列表」
+3. **勾选知识库**：下行区勾选要同步的仓库，设置目标文件夹（默认 `20-ima/知识库名`）
+4. **（可选）激活管理能力**：浏览器登录 ima.qq.com → F12 → Network → 复制首个请求的整行 Cookie 值 → 粘贴到「网页会话 Cookie」→ 点「测试网页会话」
+5. **自动同步**：默认 15 分钟，可调；ribbon ⟳ 或命令面板（搜 "ima"）手动触发
+
+## 文档索引
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构设计、模块职责、数据流、关键决策记录（ADR 风格） |
+| [docs/ima-internals.md](docs/ima-internals.md) | ima 内部接口参考（实测核对的路径/参数/认证/错误码/命名空间规则） |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | 扩展手册：已知缺口、新增能力教程、调试方法、避坑清单、发布清单 |
+| [docs/openapi-feature-request.md](docs/openapi-feature-request.md) | 致 ima 官方的删除/更新接口申请草稿 |
+
+## 同步规则（重要）
+
+- 下行为增量拉取：已同步条目跳过；云端删除**不影响本地**；本地删除不回传云端
+- 上传默认只推新文件；Cookie 模式下「真更新」仅作用于**插件自己上传的文档**
+- 防回环：下行文件带 `ima_media_id`/`ima_note_id` frontmatter，默认不回传
+- 凭证只存本地 `data.json`（已 gitignore）
+
+## 开发
 
 ```bash
 npm install
-npm run build   # 产物 main.js → 拷贝到 vault 的 .obsidian/plugins/obsidian-ima-sync/
+npm run build          # tsc 类型检查 + esbuild 打包
+node test/verify-crypto.cjs   # SHA-1/HMAC/COS 签名对拍（需先构建 cos-test.cjs，见文件内说明）
+node test/e2e-upload.cjs      # 官方通道真实上传 E2E（读 ~/.config/ima 凭证 + IMA_KB_ID 环境变量）
 ```
 
-## 测试
+欢迎 Issue/PR。提交前请确认：不含任何真实凭证；`npm run build` 通过；改动涉及 ima 接口时同步更新 `docs/ima-internals.md`。
 
-```bash
-npx esbuild src/cos.ts --bundle --format=cjs --outfile=test/cos-test.cjs "--alias:obsidian=./test/obsidian-stub.js"
-node test/verify-crypto.cjs   # SHA-1/HMAC/COS 签名 vs node crypto 参照
-node test/e2e-upload.cjs      # 真实上行链路（会向知识库上传一个测试文档）
-```
+## License
 
-## API 要点（源自实测）
-
-- 认证：Header `ima-openapi-clientid` / `ima-openapi-apikey`，全部 POST JSON 到 `https://ima.qq.com`
-- 知识库：`/openapi/wiki/v1/*`（`get_addable_knowledge_base_list`、`get_knowledge_list`、`get_media_info`、`create_media`、`add_knowledge`、`check_repeated_names`）
-- 笔记：`/openapi/note/v1/*`（`list_note`、`get_doc_content`）
-- 实测与文档的差异：文件夹在 `get_knowledge_list` 中以 `media_type=99` 混排，其 `media_id`（`folder_*`）即子级 `folder_id`；根目录 `folder_id` 是独立 ID，不等于知识库 ID
-- 限流：约 2 QPS 串行 + 退避重试（110010/110013/110021/20002）
+MIT

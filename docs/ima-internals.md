@@ -1,88 +1,100 @@
-# ima 客户端内部接口分析笔记
+# ima 内部接口参考（实测终版）
 
-> 本文记录对 **ima.copilot Windows 客户端** Web 层的互操作性分析，目的是为本插件的「删除/真更新」能力提供依据。
-> 所有信息来自客户端在本机缓存中的 Web 脚本（明文可读），未对任何服务端进行攻击性测试。
-> ⚠ 这些接口**不在官方 OpenAPI 承诺范围内**，腾讯可能随时变更；生产使用请以 [官方 OpenAPI](https://ima.qq.com/agent-interface) 为准。
+> 来源：桌面客户端 5.8.6 内置扩展（`IMA知识库`，chrome-extension://nkohmbngmopdajidckglcoehlaeepeoi）源码 + 真实流量捕获，**全部经真实调用验证**。
+> ⚠ 无兼容承诺，客户端更新可能变化；生产优先使用官方 OpenAPI。
+> 分析方法论与再验证方法见 [ROADMAP.md §调试方法](ROADMAP.md)。
 
-## 客户端架构
+## 1. 服务器与路径
 
-- `ima.copilot.exe` 是 **Chromium 壳**（chrome.dll + 版本化目录），无 Electron/asar
-- 业务 UI 为 Web 应用，业务 JS 存在于 `User Data\Default\Service Worker\ScriptCache` 与 `Code Cache`
-- 运行日志 `imainfo/*_bin.log` 为加密二进制
-- 客户端主进程监听本地 HTTPS 端口（如 `127.0.0.1:5283`），用于 agent-interface 网页唤起本地客户端
+- 生产主机：`https://ima.qq.com`（测试/预发：ima-test / ima-pre.qq.com）
+- 知识写服务：`/cgi-bin/knowledge_tab_writer/<方法>`
+- 知识读服务：`/cgi-bin/knowledge_tab_reader/<方法>`
+- 文件服务：`/cgi-bin/file_manager/<方法>`（create_media、get_upload_credential、get_media）
+- 登录刷新：`/cgi-bin/auth_login/refresh`（body `{user_id, refresh_token, token_type:14}`）
+- 加密通道：仅 `/cgi-bin/s/*`（握手头 x-ima-cm/ckey/ctk，客户端原生桥加密）——知识接口**不在其中**
+- 资源下载：`res-pkb.ima.qq.com`（需随带 `X-IMA-*` 签名头，来自 get_media_info 的 url_info.headers）
 
-## 知识库内部端点（对比官方 OpenAPI 的 8 个，共发现 21 个）
-
-前缀（实测确认）：
-- 写服务：`https://ima.qq.com/cgi-bin/knowledge_tab_writer/`（del_knowledge、update_tags、batch_update_tags、copy_knowledge、rename_knowledge、replace_knowledge、create_folder、create_knowledge_base、delete_knowledge_base、add_knowledge、set_knowledge_top 等）
-- 读服务：`https://ima.qq.com/cgi-bin/knowledge_tab_reader/`（search_tags、get_knowledge_list、search_knowledge、get_knowledge、get_knowledge_base_home_page、get_home_page_data 等）
-- 文件：`https://ima.qq.com/cgi-bin/file_manager/`（create_media（media_type 为字符串枚举如 "MARKDOWN"）、get_upload_credential、get_media）
-- 上传链路：file_manager/create_media → COS PUT（签名同官方）→ knowledge_tab_writer/add_knowledge（服务端按 cos_key 分配内部 media_id）
-- **个人知识库的 knowledge_base_id = 用户 UID（IMA-UID）**
-
-| 方法 | 官方 OpenAPI | 说明 |
-| --- | --- | --- |
-| `add_knowledge` | ✅ | 添加知识 |
-| `import_urls` | ✅ | 导入网页 |
-| `del_knowledge` | ❌ | **删除条目**，body: `{knowledge_base_id, media_ids: []}` |
-| `delete_knowledge_base` | ❌ | 删除整个知识库 |
-| `replace_knowledge` | ❌ | **替换条目内容**：`{knowledge_base_id, origin_media_id, replace_info: {media_id, media_type, file_info: {content_type, cos_key, file_name, file_size}}}`（新文件需先走 create_media + COS） |
-| `rename_knowledge` | ❌ | 重命名：`{knowledge_base_id, media_id, title, folder_id?, media_type?}` |
-| `get_tags` / `search_tags` | ❌ | 标签列表（返回 `tagInfos`）/ 搜索（`{knowledge_base_id, query, cursor, limit}`） |
-| `update_tags` | ❌ | 设置条目标签：`{knowledge_base_id, media_id, tags: []}` |
-| `batch_update_tags` | ❌ | 批量设置：`{knowledge_base_id, media_ids: [], tags}`，返回 `results[media_id].retCode` |
-| `del_tags` | ❌ | 删除标签：`{knowledge_base_id, tags: []}` |
-| `rename_tag` | ❌ | 重命名标签：`{knowledge_base_id, origin_tag, new_tag}` |
-| `copy_knowledge` | ❌ | **跨库复制**：`{media_ids: [], dst_knowledge_base_id, dst_folder_id?}`；异步任务可经 SSE `knowledge_tab_sse/resume_cross_kb_op` 轮询，`cancel_cross_kb_op {task_id}` 取消 |
-| `create_knowledge_base` / `create_folder` / `set_knowledge_top` / `set_knowledge_base_top` | ❌ | 结构管理；`create_folder`: `{knowledge_base_id, folder_id(父，根目录=知识库ID), title}`；`set_knowledge_top`: `{knowledge_base_id, folder_id, media_id, is_top}` |
-| `update_basic_info` / `update_knowledge_access_status` / `update_permission_info` | ❌ | 信息/权限（update_basic_info: `{name, description, cover?}`） |
-| `import_notes` / `parse_knowledge` / `get_user_space` / `report_knowledge` | ❌ | 其他 |
-
-另有非 knowledge 前缀：`/cgi-bin/file_manager/get_media`、`/cgi-bin/media_logic/parse_media` 等。
-
-## 认证链
-
-Web 层所有请求经 `KyServiceImpl`（基于 ky）发送，`beforeRequest` 钩子注入 `headerService.getHeader()`：
+## 2. 认证（每次请求）
 
 ```
-x-ima-cookie: <cookie 串>          ← 客户端 cookieService 组装（含 IMA-TOKEN、PLATFORM=H5、CLIENT-TYPE 等）
-x-ima-bkn: <整数>                  ← 由 IMA-TOKEN 计算（见下）
+x-ima-cookie: PLATFORM=H5; CLIENT-TYPE=256021; WEB-VERSION=5.8.6; IMA-GUID=…; IMA-Q36=…;
+              IMA-IUA=<设备串>; IMA-UID=<用户UID>; IMA-TOKEN=<token>; IMA-REFRESH-TOKEN=<refresh>;
+              UID-TYPE=2; TOKEN-TYPE=14
+x-ima-bkn:    getBkn(IMA-TOKEN)
 from_browser_ima: 1
+Content-Type: application/json
 ```
 
-`x-ima-cookie` 必须包含完整会话字段（缺任何一个都会返回 code 51 参数错误）：
+- `getBkn(token)`：`h=5381; h += (h<<5) + code; return h & 0x7FFFFFFF`（已与真实值对拍一致）
+- **缺任一 cookie 字段 → `{"code":51,"msg":"参数错误"}`**（这是最常见的坑，不是真的参数问题）
+- 会话来源：客户端登录态；网页扫码登录后 token 存于 `localStorage["ima-universal-local-storage-accountInfo"]`（token 2h / refreshToken 30d，tokenType 14）
+- token 刷新：`POST /cgi-bin/auth_login/refresh`，body 同上，响应 Set-Cookie 更新会话
 
-```
-PLATFORM=H5; CLIENT-TYPE=256021; WEB-VERSION=<版本>; IMA-GUID=…; IMA-Q36=…; IMA-IUA=<设备串>; IMA-UID=<用户UID>; IMA-TOKEN=<会话token>; IMA-REFRESH-TOKEN=<刷新token>; UID-TYPE=2; TOKEN-TYPE=14
-```
+## 3. ID 体系与命名空间（关键）
 
-`getBkn` 算法（DJB2 变体，Web 层明文逻辑，已与客户端实际值对拍一致）：
+| 概念 | 规则 |
+| --- | --- |
+| 个人知识库 ID | 内部接口一律使用**用户 UID**（IMA-UID），不是官方加密 KB ID |
+| 根目录 folder_id | = 用户 UID |
+| 客户端创建内容的内部 media_id | 形如官方 ID 的尾部（如官方 `weburl_…_e5ea1225a671a71d3ccc` → 内部 `e5ea1225a671a71d3ccc`）；文件夹为 `folder_<数字>` |
+| **命名空间隔离** | 官方 OpenAPI 上传的文档对内部接口**不可见**（读列表不显示、写操作报 500010）；内部接口也无法操作官方命名空间文档 |
+| 结论 | 需要管理（改名/删除/标签）的上传必须走内部上传链路（§5） |
 
-```js
-function getBkn(token) {
-  let hash = 5381;
-  for (let i = 0; i < token.length; i++) hash += (hash << 5) + token.charCodeAt(i);
-  return String(hash & 0x7fffffff);
-}
-```
+## 4. 写服务（knowledge_tab_writer，除注明外全部实测 ✅）
 
-与官方 OpenAPI（`ima-openapi-clientid` / `ima-openapi-apikey` 头）是**两套独立体系**，不可互通；且**两个命名空间的媒体互相不可见**：官方接口上传的文档，内部接口查不到（写操作报 500010 数据不存在），反之亦然。
+| 方法 | body（snake_case） | 返回/备注 |
+| --- | --- | --- |
+| `del_knowledge` | `{knowledge_base_id, media_ids: []}` | **文档与文件夹通用**；返回 `results[media_id].ret_code` |
+| `update_tags` | `{knowledge_base_id, media_id, folder_id?, media_type?, tags: []}` | 覆盖式设置 |
+| `batch_update_tags` | `{knowledge_base_id, media_ids: [], tags}` | 返回逐条成败 |
+| `rename_knowledge` | `{knowledge_base_id, media_id, title, folder_id?, media_type?, action: 0, is_searching: false}` | action: 0=Default 1=Save |
+| `create_folder` | `{knowledge_base_id, folder_id(父，根=UID), title}` | 返回完整 knowledge 对象（含 media_id=`folder_*`） |
+| `copy_knowledge` | `{media_ids: [], dst_knowledge_base_id, dst_folder_id?}` | 返回新 media_ids；跨库同形 |
+| `create_knowledge_base` | `{name}` | 返回 info（含 basic_info） |
+| `delete_knowledge_base` | **`{id}`**（注意不是 knowledge_base_id） | — |
+| `set_knowledge_top` | `{knowledge_base_id, folder_id, media_id, is_top}` | 未实测 |
+| `add_knowledge` | `{knowledge_base_id, media_type: 7, title, folder_id?, file_info: {cos_key, file_size, last_modify_time, file_name}}` | 返回服务端分配的内部 media_id（**请求无需 media_id**） |
+| `rename_tag` | `{knowledge_base_id, origin_tag, new_tag}` | — |
+| `del_tags` | `{knowledge_base_id, tags: []}` | — |
+| `replace_knowledge` | `{knowledge_base_id, origin_media_id, replace_info: {media_type, file_info}}` | ❌ 实测 600100 服务繁忙（重试同样），暂不可用 |
+| `update_basic_info` | `{name, description, cover?}` | 未实测 |
+| `cancel_cross_kb_op` | `{task_id}` | 取消复制任务 |
 
-实测结果：search_tags ✅ / update_tags ✅ / rename_knowledge ✅ / create_folder ✅ / copy_knowledge ✅ / del_knowledge（文档与文件夹）✅ / create_knowledge_base（body `{name}`）✅ / delete_knowledge_base（body `{id}`）✅ / 内部上传链路 ✅；replace_knowledge ❌（600100，用删旧+新增替代）。
+## 5. 读服务（knowledge_tab_reader）
 
-## 安全通道（本插件不涉及）
+| 方法 | body | 返回 |
+| --- | --- | --- |
+| `search_tags` | `{knowledge_base_id, query, cursor, limit}` | `searched_tags[].tag_info.tag` + 游标 |
+| `search_knowledge` | `{knowledge_base_id, query, cursor}` | `searched_knowledge_list[].knowledge{media_id, title, media_type, parent_folder_id, tags}` |
+| `get_knowledge_base_home_page` | `{knowledge_base_id, knowledge_list_req: {knowledge_base_id, folder_id, sort_type: 9, need_default_cover, cursor?}}` | `list_rsp.knowledge_list[]`（basic_info 含 media_id/title/media_type/parent_folder_id/tags）+ current_path + 游标 |
+| `get_home_page_data` | `{knowledge_base_list_req: {params: [{type: 1001\|1002\|1004\|1005, cursor, limit}]}}` | 全部知识库列表（含共享库分类） |
+| `get_knowledge` | `{knowledge_base_id, media_id, folder_id?}` | 单条详情 |
+| `get_knowledge_list` | 同 home_page 的 knowledge_list_req | 纯列表 |
 
-路径前缀 `/cgi-bin/s/*` 走加密通道（握手头 `x-ima-cm` / `x-ima-ckey` / `x-ima-ctk`，加密由客户端原生桥 cryptoService 提供）。知识库接口不在此前缀下，为普通 HTTPS + 上述认证头。
+## 6. 文件服务（file_manager）
 
-## 本插件的集成方式（Cookie 模式）
+| 方法 | body | 返回 |
+| --- | --- | --- |
+| `create_media` | `{knowledge_base_id, file_name, file_size, content_type, file_ext, media_type: "MARKDOWN"}` | **media_type 是字符串枚举**（PDF/WEB/WORD/…/MARKDOWN/…）；返回 `cos_credential{bucket_name, region, cos_key, secret_id, secret_key, token, start_time, expired_time}`（时间戳为**字符串**） |
+| `get_upload_credential` | 同上 | 同结构 |
+| `get_media` | — | 下载地址 |
 
-1. 用户在浏览器登录 ima.qq.com，从 DevTools 复制**自己的** Cookie（yt-dlp cookies.txt 同款模式）
-2. 粘贴进插件设置；插件从中提取 `IMA-TOKEN` 计算 bkn，组装上述认证头
-3. 能力范围严格受限：**只删除 `upIndex` 中记录的、插件自己上传的 media_id**（用于「真更新 = 删旧 + 原名重传」）；下行同步的本地内容永不触发云端删除
-4. Cookie 失效时功能自动降级回「副本上传/跳过」并提示
+上传链路：`create_media` → COS PUT（签名同官方通道，见 src/cos.ts）→ `knowledge_tab_writer/add_knowledge`（**请求不含 media_id**，服务端按 cos_key 分配并返回）。
 
-## 风险声明
+## 7. 官方 OpenAPI 通道（对照）
 
-- 内部端点无兼容性承诺，客户端更新可能使其失效
-- 调用模式与客户端不同（无完整设备指纹），理论上存在被风控识别的可能，请自行评估
-- 删除操作不可逆（官方无回收站 API），插件侧已用「仅限自上传内容」收敛风险
+- 网关：`/openapi/wiki/v1/*`、`/openapi/note/v1/*`；头 `ima-openapi-clientid`/`ima-openapi-apikey`
+- 与内部接口**互不认证、互不可见**（官方凭证调内部路径 404）
+- 能力：get_addable_knowledge_base_list / get_knowledge_list / get_media_info / create_media / add_knowledge / check_repeated_names / search_*；notes: list_note / get_doc_content / import_doc / append_doc
+- 无：删除、改名、标签、复制、文件夹、更新
+
+## 8. 错误码速查（实测）
+
+| code | 含义 | 处置 |
+| --- | --- | --- |
+| 51 | 参数错误（**最常见诱因是 x-ima-cookie 缺会话字段**） | 核对认证头完整性 |
+| 500010 | 该数据不存在 | 多为拿官方 media_id 调内部接口（命名空间错位），或个人库没用 UID |
+| 600100 | 服务繁忙（replace_knowledge 实测恒定返回） | 改用 del+add |
+| 110021 / 20002 | 请求频控 | 退避重试（插件已内置） |
+| 200001 | 请求频率超限 | **未加入插件重试表（TODO）**，出现时应长退避 |
+| 404 空体 | 路径不存在或被隐藏 | 核对前缀（writer/reader/file_manager） |
