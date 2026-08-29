@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-ima-sync",
+  "name": "IMA Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.0",
+  "description": "双向同步腾讯 ima 知识库与 Obsidian vault：按用户选择的知识库定时下行，将指定文件夹的笔记上行到 ima（基于 ima 官方 OpenAPI）。",
+  "author": "xuan",
+  "isDesktopOnly": false
+}

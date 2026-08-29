@@ -1,0 +1,20 @@
+{
+  "name": "obsidian-ima-sync",
+  "version": "1.0.0",
+  "description": "双向同步腾讯 ima 知识库与 Obsidian vault（基于 ima 官方 OpenAPI）",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": [],
+  "author": "xuan",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.24.2",
+    "obsidian": "^1.8.7",
+    "typescript": "^5.7.2"
+  }
+}
