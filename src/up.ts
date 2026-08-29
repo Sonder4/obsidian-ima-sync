@@ -1,5 +1,6 @@
 import { normalizePath, TFile, TFolder, type App } from "obsidian";
 import type { ImaClient } from "./api";
+import { ImaCgiClient } from "./cgi";
 import { uploadToCos, contentHash } from "./cos";
 import { frontmatterHasKey } from "./convert";
 import { MediaType } from "./types";
@@ -8,11 +9,20 @@ import type { ImaSyncSettings, UpMapping } from "./settings";
 import type { SyncSummary } from "./down";
 
 export class UpSync {
+	private cgi: ImaCgiClient | null = null;
+
 	constructor(
 		private app: App,
 		private client: ImaClient,
 		private settings: ImaSyncSettings,
 	) {}
+
+	/** 用户提供了网页会话 Cookie 时启用「真更新」（删除旧版 + 重传） */
+	private getCgi(): ImaCgiClient | null {
+		if (!this.settings.webCookie.trim()) return null;
+		if (!this.cgi) this.cgi = new ImaCgiClient(this.settings.webCookie);
+		return this.cgi;
+	}
 
 	async syncAll(onProgress?: (msg: string) => void): Promise<SyncSummary> {
 		const summary: SyncSummary = { created: 0, skipped: 0, failed: 0, notes: [] };
@@ -42,6 +52,7 @@ export class UpSync {
 			// 分拣：新增 / 未变化 / 有修改
 			const fresh: TFile[] = [];
 			const changed: { file: TFile; hash: string }[] = [];
+			const cgi = this.getCgi();
 			for (const file of candidates) {
 				const content = await this.app.vault.read(file);
 				const hash = contentHash(content);
@@ -55,8 +66,9 @@ export class UpSync {
 						changed.push({ file, hash });
 					} else {
 						summary.skipped++;
+						const hint = cgi ? "可在设置开启「重新上传」" : "官方 API 不支持覆盖更新，未回传";
 						if (!summary.notes.some((n) => n.startsWith("以下已上传文件有本地修改")))
-							summary.notes.push("以下已上传文件有本地修改（官方 API 不支持覆盖更新，未回传）：");
+							summary.notes.push(`以下已上传文件有本地修改（${hint}）：`);
 						summary.notes.push(`　· ${file.path}`);
 					}
 					continue;
@@ -95,6 +107,22 @@ export class UpSync {
 			}
 			for (const { file, hash } of changed) {
 				onProgress?.(file.path);
+				const prev = this.settings.upIndex[file.path];
+				const cgi = this.getCgi();
+				if (cgi && prev?.mediaId && !prev.uploadedAs) {
+					// 真更新：删除插件自己上传的旧版，再以原文件名重传（内容在 ima 端无副本残留）
+					try {
+						await cgi.delKnowledge(mapping.kbId, [prev.mediaId]);
+						delete this.settings.upIndex[file.path];
+						await this.upload(file, mapping, undefined, summary, hash);
+						continue;
+					} catch (err) {
+						summary.notes.push(
+							`「${file.basename}」真更新失败（${err instanceof Error ? err.message : String(err)}），回退为副本上传`,
+						);
+						// 继续走副本逻辑
+					}
+				}
 				const stamp = window.moment(file.stat.mtime).format("YYYY-MM-DD HHmm");
 				const copyBase = `${sanitizeFilename(file.basename)}（更新 ${stamp}）`;
 				await this.upload(file, mapping, copyBase, summary, hash);

@@ -247,6 +247,55 @@ export class ImaSettingTab extends PluginSettingTab {
 				}),
 			);
 
+		// ============ 网页会话（可选的删除/真更新能力） ============
+		containerEl.createEl("h3", { text: "网页会话（可选：启用删除与真更新）" });
+		containerEl.createEl("p", {
+			text: "留空 = 该功能完全关闭，插件行为与官方 API 一致。粘贴 Cookie 后：已上传文件的修改将从「副本上传」升级为「真更新」（删除旧版 + 原名重传）。删除能力只作用于插件自己上传的文档，绝不会触碰下行同步来的内容。",
+			cls: "mod-muted",
+		});
+		containerEl.createEl("p", {
+			text: "获取方式：浏览器打开 ima.qq.com 并登录 → F12 打开开发者工具 → Network（网络）→ 刷新页面 → 点击第一个 ima.qq.com 请求 → Request Headers（请求标头）→ 复制整行 Cookie: 后面的值，粘贴到下面。会话过期后功能失效，重新复制一次即可。",
+			cls: "mod-muted",
+		});
+		new Setting(containerEl)
+			.setName("网页会话 Cookie")
+			.setDesc("仅保存在本地 data.json（已 gitignore）；只发送到 ima.qq.com")
+			.addText((text) => {
+				text.inputEl.type = "password";
+				text.setPlaceholder("粘贴 ima.qq.com 的 Cookie 值…");
+				text.setValue(s.webCookie).onChange(async (v) => {
+					s.webCookie = v.trim();
+					await this.plugin.saveSettings();
+				});
+			});
+		new Setting(containerEl)
+			.setName("测试网页会话")
+			.setDesc("用最小请求验证 Cookie 是否有效（不会删除任何内容）")
+			.addButton((btn) =>
+				btn.setButtonText("测试").onClick(async () => {
+					btn.setDisabled(true).setButtonText("测试中…");
+					try {
+						const { ImaCgiClient } = await import("./cgi");
+						const cgi = new ImaCgiClient(s.webCookie);
+						// 用一个必然不存在的 media_id 探测：端点与鉴权正常时会返回业务错误（如"不存在"），
+						// 会话失效则返回登录错误。都不会产生实际删除。
+						try {
+							await cgi.delKnowledge("probe_kb_id", ["probe_media_id"]);
+							new Notice("网页会话有效（探测请求返回正常）");
+						} catch (err) {
+							const msg = err instanceof Error ? err.message : String(err);
+							if (/登录|login|auth|权限|ticket|cookie/i.test(msg)) {
+								new Notice(`Cookie 无效或已过期：${msg}`, 8000);
+							} else {
+								new Notice(`接口可达（探测返回业务错误：${msg}）`, 8000);
+							}
+						}
+					} finally {
+						btn.setDisabled(false).setButtonText("测试");
+					}
+				}),
+			);
+
 		// ============ 自动同步 ============
 		containerEl.createEl("h3", { text: "自动同步" });
 		new Setting(containerEl)

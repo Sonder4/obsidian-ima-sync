@@ -50,6 +50,8 @@ export interface ImaSyncSettings {
 	reuploadChanged: boolean;
 	// 跳过来自 ima 的文件（frontmatter 含 ima_media_id / ima_note_id），防止回环
 	skipImaFiles: boolean;
+	// 用户自愿提供的 ima.qq.com 网页会话 Cookie（启用「删除/真更新」能力；留空 = 功能完全关闭）
+	webCookie: string;
 	// 同步索引
 	downIndex: Record<string, DownIndexEntry>;
 	upIndex: Record<string, UpIndexEntry>;
@@ -71,6 +73,7 @@ export const DEFAULT_SETTINGS: ImaSyncSettings = {
 	attachmentFolder: "90-Attachment/ima",
 	reuploadChanged: false,
 	skipImaFiles: true,
+	webCookie: "",
 	downIndex: {},
 	upIndex: {},
 	noteIndex: {},
