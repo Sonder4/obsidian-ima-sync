@@ -13,7 +13,12 @@
 
 ## 知识库内部端点（对比官方 OpenAPI 的 8 个，共发现 21 个）
 
-前缀：`https://ima.qq.com/cgi-bin/knowledge/`（Web 层 `KyUrlPrefix` 绑定为 `${host}/cgi-bin/`，知识服务在此基础上拼方法名）
+前缀（实测确认）：
+- 写服务：`https://ima.qq.com/cgi-bin/knowledge_tab_writer/`（del_knowledge、update_tags、batch_update_tags、copy_knowledge、rename_knowledge、replace_knowledge、create_folder、create_knowledge_base、delete_knowledge_base、add_knowledge、set_knowledge_top 等）
+- 读服务：`https://ima.qq.com/cgi-bin/knowledge_tab_reader/`（search_tags、get_knowledge_list、search_knowledge、get_knowledge、get_knowledge_base_home_page、get_home_page_data 等）
+- 文件：`https://ima.qq.com/cgi-bin/file_manager/`（create_media（media_type 为字符串枚举如 "MARKDOWN"）、get_upload_credential、get_media）
+- 上传链路：file_manager/create_media → COS PUT（签名同官方）→ knowledge_tab_writer/add_knowledge（服务端按 cos_key 分配内部 media_id）
+- **个人知识库的 knowledge_base_id = 用户 UID（IMA-UID）**
 
 | 方法 | 官方 OpenAPI | 说明 |
 | --- | --- | --- |
@@ -45,7 +50,13 @@ x-ima-bkn: <整数>                  ← 由 IMA-TOKEN 计算（见下）
 from_browser_ima: 1
 ```
 
-`getBkn` 算法（DJB2 变体，Web 层明文逻辑）：
+`x-ima-cookie` 必须包含完整会话字段（缺任何一个都会返回 code 51 参数错误）：
+
+```
+PLATFORM=H5; CLIENT-TYPE=256021; WEB-VERSION=<版本>; IMA-GUID=…; IMA-Q36=…; IMA-IUA=<设备串>; IMA-UID=<用户UID>; IMA-TOKEN=<会话token>; IMA-REFRESH-TOKEN=<刷新token>; UID-TYPE=2; TOKEN-TYPE=14
+```
+
+`getBkn` 算法（DJB2 变体，Web 层明文逻辑，已与客户端实际值对拍一致）：
 
 ```js
 function getBkn(token) {
@@ -55,7 +66,9 @@ function getBkn(token) {
 }
 ```
 
-与官方 OpenAPI（`ima-openapi-clientid` / `ima-openapi-apikey` 头）是**两套独立体系**：用 OpenAPI 凭证调内部端点返回 HTTP 404，不可互通。
+与官方 OpenAPI（`ima-openapi-clientid` / `ima-openapi-apikey` 头）是**两套独立体系**，不可互通；且**两个命名空间的媒体互相不可见**：官方接口上传的文档，内部接口查不到（写操作报 500010 数据不存在），反之亦然。
+
+实测结果：search_tags ✅ / update_tags ✅ / rename_knowledge ✅ / create_folder ✅ / copy_knowledge ✅ / del_knowledge（文档与文件夹）✅ / create_knowledge_base（body `{name}`）✅ / delete_knowledge_base（body `{id}`）✅ / 内部上传链路 ✅；replace_knowledge ❌（600100，用删旧+新增替代）。
 
 ## 安全通道（本插件不涉及）
 

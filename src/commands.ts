@@ -45,6 +45,32 @@ export function getCgi(plugin: ImaSyncPlugin): ImaCgiClient {
 	return new ImaCgiClient(plugin.settings.webCookie);
 }
 
+/**
+ * 把活动笔记解析为内部命名空间对象：{ kbId(=UID), mediaId(内部), folderId }。
+ * 内部 media_id 与官方 OpenAPI 的不同，需按标题搜索解析。
+ */
+export async function resolveInternal(
+	plugin: ImaSyncPlugin,
+	cgi: ImaCgiClient,
+	info: ActiveImaInfo,
+): Promise<{ kbId: string; mediaId: string; folderId?: string; mediaType?: number } | null> {
+	const kbId = cgi.personalKbId;
+	const base = info.file.basename;
+	for (const q of [base, `${base}.md`, info.title ?? ""]) {
+		if (!q) continue;
+		const hits = await cgi.searchKnowledge(kbId, q);
+		const hit = hits.find((h) => h.title === base || h.title === `${base}.md` || h.title === info.title);
+		if (hit) {
+			return { kbId, mediaId: hit.media_id, folderId: hit.parent_folder_id, mediaType: hit.media_type };
+		}
+	}
+	new Notice(
+		`ima 内部命名空间中未找到「${base}」：官方接口上传的内容对内部接口不可见。\n请对该笔记使用一次「上行同步（内部通道）」后重试。`,
+		9000,
+	);
+	return null;
+}
+
 /** 知识库选择器（在线列表，失败回退设置缓存） */
 class KbPickerModal extends FuzzySuggestModal<{ id: string; name: string }> {
 	constructor(
@@ -149,6 +175,11 @@ class TagEditModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.createEl("h3", { text: "编辑 ima 标签" });
+		const target = await resolveInternal(this.plugin, this.cgi, this.info);
+		if (!target) {
+			this.close();
+			return;
+		}
 		const input = contentEl.createEl("input", { type: "text" });
 		input.style.width = "100%";
 		input.value = this.info.tags.join("，");
@@ -175,7 +206,7 @@ class TagEditModal extends Modal {
 				.map((t) => t.trim())
 				.filter(Boolean);
 			try {
-				await this.cgi.updateTags(this.info.kbId, this.info.mediaId, tags);
+				await this.cgi.updateTags(target.kbId, target.mediaId, tags, target.folderId, target.mediaType);
 				// 同步 frontmatter
 				await this.plugin.app.fileManager.processFrontMatter(this.info.file, (fm) => {
 					fm.tags = tags;
@@ -193,7 +224,7 @@ class TagEditModal extends Modal {
 
 		// 加载知识库标签建议
 		try {
-			const kbTags = await this.cgi.getTags(this.info.kbId);
+			const kbTags = await this.cgi.getTags(target.kbId);
 			for (const t of kbTags) {
 				if (!t.tag) continue;
 				const chip = sugBox.createEl("button", { text: t.tag });
@@ -245,7 +276,7 @@ class KbTagManageModal extends Modal {
 				row.style.alignItems = "center";
 				row.style.gap = "8px";
 				row.style.padding = "4px 0";
-				row.createEl("span", { text: t.tag + (t.count ? `（${t.count}）` : "") }).style.flex = "1";
+				row.createEl("span", { text: t.tag }).style.flex = "1";
 				const renameBtn = row.createEl("button", { text: "重命名" });
 				renameBtn.onclick = () => {
 					this.close();
@@ -320,28 +351,34 @@ export function registerImaManageCommands(plugin: ImaSyncPlugin): void {
 		checkCallback: (checking: boolean) => {
 			const info = getActiveImaInfo(plugin, true, checking);
 			if (!checking && info) {
-				new TextInputModal(
-					plugin.app,
-					"重命名 ima 标题",
-					"新标题",
-					info.title || info.file.basename,
-					async (title) => {
-						try {
-							await getCgi(plugin).renameKnowledge({
-								kbId: info.kbId,
-								mediaId: info.mediaId,
-								title,
-								mediaType: info.mediaType,
-							});
-							await plugin.app.fileManager.processFrontMatter(info.file, (fm) => {
-								fm.title = title;
-							});
-							new Notice(`已重命名为「${title}」`);
-						} catch (err) {
-							new Notice(`失败：${err instanceof Error ? err.message : String(err)}`, 8000);
-						}
-					},
-				).open();
+				void (async () => {
+					const cgi = getCgi(plugin);
+					const target = await resolveInternal(plugin, cgi, info);
+					if (!target) return;
+					new TextInputModal(
+						plugin.app,
+						"重命名 ima 标题",
+						"新标题",
+						info.title || info.file.basename,
+						async (title) => {
+							try {
+								await cgi.renameKnowledge({
+									kbId: target.kbId,
+									mediaId: target.mediaId,
+									title,
+									folderId: target.folderId,
+									mediaType: target.mediaType,
+								});
+								await plugin.app.fileManager.processFrontMatter(info.file, (fm) => {
+									fm.title = title;
+								});
+								new Notice(`已重命名为「${title}」`);
+							} catch (err) {
+								new Notice(`失败：${err instanceof Error ? err.message : String(err)}`, 8000);
+							}
+						},
+					).open();
+				})();
 			}
 			return !!info;
 		},
@@ -354,24 +391,29 @@ export function registerImaManageCommands(plugin: ImaSyncPlugin): void {
 		checkCallback: (checking: boolean) => {
 			const info = getActiveImaInfo(plugin, true, checking);
 			if (!checking && info) {
-				pickKb(plugin, async (kb) => {
-					if (kb.id === info.kbId) {
-						new Notice("本文已在该知识库中");
-						return;
-					}
-					try {
-						const r = await getCgi(plugin).copyKnowledge({ mediaIds: [info.mediaId], dstKbId: kb.id });
-						new Notice(`已发起复制到「${kb.name}」${r.taskId ? `（任务 ${r.taskId}，大文件需要处理时间）` : ""}`, 6000);
-					} catch (err) {
-						new Notice(`复制失败：${err instanceof Error ? err.message : String(err)}`, 8000);
-					}
-				});
+				void (async () => {
+					const cgi = getCgi(plugin);
+					const target = await resolveInternal(plugin, cgi, info);
+					if (!target) return;
+					pickKb(plugin, async (kb) => {
+						if (kb.id === info.kbId) {
+							new Notice("本文已在该知识库中");
+							return;
+						}
+						try {
+							const r = await cgi.copyKnowledge({ mediaIds: [target.mediaId], dstKbId: kb.id });
+							new Notice(`已发起复制到「${kb.name}」${r.mediaIds?.length ? `（新 media_id: ${r.mediaIds[0].slice(-16)}）` : ""}`, 6000);
+						} catch (err) {
+							new Notice(`复制失败：${err instanceof Error ? err.message : String(err)}`, 8000);
+						}
+					});
+				})();
 			}
 			return !!info;
 		},
 	});
 
-	// 4. 用本文内容替换 ima 原文（真·内容更新；下行文档也可用）
+	// 4. 用本文内容替换 ima 原文（内部通道：上传新版本 → replace；replace 不可用时回退删除+重建）
 	plugin.addCommand({
 		id: "ima-replace-content",
 		name: "用本文内容替换 ima 原文",
@@ -379,41 +421,30 @@ export function registerImaManageCommands(plugin: ImaSyncPlugin): void {
 			const info = getActiveImaInfo(plugin, true, checking);
 			if (!checking && info) {
 				void (async () => {
+					const cgi = getCgi(plugin);
+					const target = await resolveInternal(plugin, cgi, info);
+					if (!target) return;
 					try {
-						const { ImaClient } = await import("./api");
-						const { uploadToCos } = await import("./cos");
-						const client = new ImaClient(plugin.settings.clientId, plugin.settings.apiKey);
-						const cgi = getCgi(plugin);
-						// 去掉 frontmatter 后作为新 Markdown 上传
+						// 去掉 frontmatter 后经内部通道上传新版本
 						const raw = await plugin.app.vault.read(info.file);
 						const content = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim() || raw;
 						const bytes = new TextEncoder().encode(content);
 						const fileName = `${info.file.basename}.md`;
-						const cm = await client.createMedia({
-							file_name: fileName,
-							file_size: bytes.byteLength,
-							content_type: "text/markdown",
-							knowledge_base_id: info.kbId,
-							file_ext: "md",
-						});
-						await uploadToCos(bytes, cm.cos_credential, "text/markdown");
-						await cgi.replaceKnowledge({
-							kbId: info.kbId,
-							originMediaId: info.mediaId,
-							newMediaId: cm.media_id,
-							newMediaType: 7,
-							fileInfo: {
-								contentType: "text/markdown",
-								cosKey: cm.cos_credential.cos_key,
-								fileName,
-								fileSize: bytes.byteLength,
-							},
-						});
+						const { mediaId: newMediaId } = await cgi.uploadMarkdown(target.kbId, fileName, bytes, target.folderId);
+						// 删除旧版本（replace_knowledge 服务端暂不可用，采用删旧+新版）
+						if (target.mediaId !== newMediaId) {
+							try {
+								await cgi.delKnowledge(target.kbId, [target.mediaId]);
+							} catch {
+								// 旧版删除失败不阻断（保留旧版，仅提示）
+								new Notice("旧版本删除失败，知识库中同时存在新旧两个版本", 8000);
+							}
+						}
 						await plugin.app.fileManager.processFrontMatter(info.file, (fm) => {
-							fm.ima_media_id = cm.media_id;
+							fm.ima_media_id = newMediaId;
 							fm.synced = new Date().toISOString();
 						});
-						new Notice("已用本文内容替换 ima 原文");
+						new Notice("已用本文内容替换 ima 原文（删除旧版 + 新版）");
 					} catch (err) {
 						new Notice(`替换失败：${err instanceof Error ? err.message : String(err)}`, 8000);
 					}
@@ -430,16 +461,14 @@ export function registerImaManageCommands(plugin: ImaSyncPlugin): void {
 		callback: () => {
 			const cgi = requireCookie();
 			if (!cgi) return;
-			pickKb(plugin, (kb) => {
-				new TextInputModal(plugin.app, `在「${kb.name}」根目录新建文件夹`, "文件夹名称", "", async (title) => {
-					try {
-						await cgi.createFolder(kb.id, kb.id, title);
-						new Notice(`已创建文件夹「${title}」`);
-					} catch (err) {
-						new Notice(`失败：${err instanceof Error ? err.message : String(err)}`, 8000);
-					}
-				}).open();
-			});
+			new TextInputModal(plugin.app, "新建文件夹（个人知识库根目录）", "文件夹名称", "", async (title) => {
+				try {
+					await cgi.createFolder(cgi.personalKbId, cgi.personalKbId, title);
+					new Notice(`已创建文件夹「${title}」`);
+				} catch (err) {
+					new Notice(`失败：${err instanceof Error ? err.message : String(err)}`, 8000);
+				}
+			}).open();
 		},
 	});
 
@@ -451,12 +480,9 @@ export function registerImaManageCommands(plugin: ImaSyncPlugin): void {
 			const cgi = requireCookie();
 			if (!cgi) return;
 			// 优先用当前笔记所在知识库
-			const info = getActiveImaInfo(plugin, false);
-			if (info) {
-				new KbTagManageModal(plugin, info.kbId, cgi).open();
-				return;
-			}
-			pickKb(plugin, (kb) => new KbTagManageModal(plugin, kb.id, cgi).open());
+			const info = getActiveImaInfo(plugin, false, true);
+			new KbTagManageModal(plugin, cgi.personalKbId, cgi).open();
+			void info;
 		},
 	});
 

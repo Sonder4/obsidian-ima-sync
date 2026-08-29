@@ -103,25 +103,55 @@ export class UpSync {
 
 			for (const file of freshAfterCheck) {
 				onProgress?.(file.path);
+				// Cookie 模式优先走内部命名空间上传（此后文档可改名/删除/打标签）
+				const cgi = this.getCgi();
+				if (cgi && cgi.configured) {
+					try {
+						const content = await this.app.vault.read(file);
+						if (this.settings.skipImaFiles && frontmatterHasKey(content, ["ima_media_id"])) {
+							summary.skipped++;
+							continue;
+						}
+						const bytes = new TextEncoder().encode(content);
+						const fileName = `${sanitizeFilename(file.basename)}.md`;
+						const { mediaId } = await cgi.uploadMarkdown(cgi.personalKbId, fileName, bytes);
+						this.settings.upIndex[file.path] = {
+							mediaId,
+							kbId: cgi.personalKbId,
+							hash: contentHash(content),
+						};
+						summary.created++;
+						continue;
+					} catch (err) {
+						summary.notes.push(`内部通道上传「${file.path}」失败，回退官方接口：${err instanceof Error ? err.message : String(err)}`);
+					}
+				}
 				await this.upload(file, mapping, undefined, summary);
 			}
 			for (const { file, hash } of changed) {
 				onProgress?.(file.path);
 				const prev = this.settings.upIndex[file.path];
 				const cgi = this.getCgi();
-				if (cgi && prev?.mediaId && !prev.uploadedAs) {
-					// 真更新：删除插件自己上传的旧版，再以原文件名重传（内容在 ima 端无副本残留）
+				if (cgi && prev?.mediaId && prev.kbId === cgi.personalKbId) {
+					// 真更新：删除插件自己上传的旧版，再以原文件名经内部通道重传
 					try {
-						await cgi.delKnowledge(mapping.kbId, [prev.mediaId]);
+						await cgi.delKnowledge(prev.kbId, [prev.mediaId]);
 						delete this.settings.upIndex[file.path];
-						await this.upload(file, mapping, undefined, summary, hash);
+						const content = await this.app.vault.read(file);
+						const bytes = new TextEncoder().encode(content);
+						const fileName = `${sanitizeFilename(file.basename)}.md`;
+						const { mediaId } = await cgi.uploadMarkdown(prev.kbId, fileName, bytes);
+						this.settings.upIndex[file.path] = { mediaId, kbId: prev.kbId, hash: hash ?? contentHash(content) };
+						summary.created++;
 						continue;
 					} catch (err) {
 						summary.notes.push(
 							`「${file.basename}」真更新失败（${err instanceof Error ? err.message : String(err)}），回退为副本上传`,
 						);
-						// 继续走副本逻辑
 					}
+				}
+				if (cgi && prev?.mediaId && prev.kbId !== cgi.personalKbId) {
+					// 官方通道上传的旧文档：内部接口不可见，仅副本模式
 				}
 				const stamp = window.moment(file.stat.mtime).format("YYYY-MM-DD HHmm");
 				const copyBase = `${sanitizeFilename(file.basename)}（更新 ${stamp}）`;

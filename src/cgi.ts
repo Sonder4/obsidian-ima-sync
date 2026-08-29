@@ -1,15 +1,24 @@
 import { requestUrl } from "obsidian";
 
-// ima 内部 cgi 接口客户端（逆向自 ima 客户端 Web 层，见 docs/ima-internals.md）
+// ima 内部 cgi 接口客户端（逆向自 ima 客户端 5.8.6 扩展 + 桌面端真实流量捕获，见 docs/ima-internals.md）
 //
 // ⚠ 使用边界：
 // - 这些端点不在官方 OpenAPI 承诺范围内，腾讯可能随时变更
-// - 会话凭证由用户在设置中自愿提供（来自用户自己登录的 ima.qq.com），插件不做任何凭证提取
+// - 会话凭证由用户在设置中自愿提供（完整 x-ima-cookie），插件不做任何凭证提取
 // - 删除操作只应作用于插件自己上传的文档（见 up.ts 的调用约束）
+//
+// 实测要点：
+// - 认证：x-ima-cookie 需含完整客户端字段（IMA-UID/IMA-TOKEN/IMA-REFRESH-TOKEN/UID-TYPE/TOKEN-TYPE/CLIENT-TYPE=256021 等）
+//   + x-ima-bkn = getBkn(IMA-TOKEN)
+// - 个人知识库在这些接口中的 knowledge_base_id = 用户 UID（IMA-UID）
+// - 内部命名空间与官方 OpenAPI 的媒体 ID 不同：内部上传后由服务端分配 media_id
 
 const CGI_BASE = "https://ima.qq.com";
+const WRITER = "knowledge_tab_writer";
+const READER = "knowledge_tab_reader";
+const FILEMGR = "file_manager";
 
-// x-ima-bkn 算法（客户端 Web 层的公开逻辑）：DJB2 变体哈希
+// x-ima-bkn 算法（与客户端一致，已实测对拍）
 export function getBkn(token: string): string {
 	try {
 		let hash = 5381;
@@ -31,28 +40,41 @@ export class CgiError extends Error {
 	}
 }
 
-export interface TagInfo {
-	tag: string;
-	count?: number;
+export interface InternalKnowledge {
+	media_id: string;
+	media_type: number;
+	title: string;
+	parent_folder_id?: string;
+	tags?: string[];
 }
 
 export class ImaCgiClient {
-	constructor(private cookieString: string) {}
+	private uid = "";
 
-	get configured(): boolean {
-		return this.cookieString.trim().length > 20 && this.cookieString.includes("=");
+	constructor(private cookieString: string) {
+		const m = /(?:^|;\s*)IMA-UID=([^;]+)/.exec(this.cookieString.trim());
+		if (m) this.uid = m[1].trim();
 	}
 
-	/** 从用户提供的 cookie 串中提取 IMA-TOKEN 并计算 bkn */
+	get configured(): boolean {
+		const c = this.cookieString.trim();
+		return c.length > 40 && c.includes("IMA-TOKEN=") && !!this.uid;
+	}
+
+	/** 个人知识库的内部 ID = 用户 UID */
+	get personalKbId(): string {
+		return this.uid;
+	}
+
 	private authHeaders(): Record<string, string> {
 		let cookie = this.cookieString.trim();
-		// 客户端请求会携带这两个字段；网页 cookie 里缺失时补默认值
 		if (!/(^|;\s*)PLATFORM=/.test(cookie)) cookie += "; PLATFORM=H5";
-		if (!/(^|;\s*)CLIENT-TYPE=/.test(cookie)) cookie += "; CLIENT-TYPE=H5";
-
+		if (!/(^|;\s*)CLIENT-TYPE=/.test(cookie)) cookie += "; CLIENT-TYPE=256021";
 		const headers: Record<string, string> = {
 			"x-ima-cookie": cookie,
+			"x-ima-bkn": "0",
 			from_browser_ima: "1",
+			accept: "application/json",
 			"Content-Type": "application/json",
 		};
 		const m = /(?:^|;\s*)IMA-TOKEN=([^;]+)/.exec(cookie);
@@ -62,7 +84,7 @@ export class ImaCgiClient {
 
 	private async post<T = Record<string, unknown>>(apiPath: string, body: unknown): Promise<T> {
 		const res = await requestUrl({
-			url: `${CGI_BASE}${apiPath}`,
+			url: `${CGI_BASE}/cgi-bin/${apiPath}`,
 			method: "POST",
 			headers: this.authHeaders(),
 			body: JSON.stringify(body ?? {}),
@@ -75,142 +97,100 @@ export class ImaCgiClient {
 			throw new CgiError(-1, `响应异常（HTTP ${res.status}）：${res.text.slice(0, 100) || "空响应体"}`);
 		}
 		const code = Number(json.code);
-		if (code !== 0) {
-			throw new CgiError(code, String(json.msg ?? `错误码 ${code}`));
-		}
-		return (json.data ?? {}) as T;
+		if (code !== 0) throw new CgiError(code, String(json.msg ?? `错误码 ${code}`));
+		return (json.data ?? json) as T;
 	}
 
-	// ===== 删除（up.ts 真更新用） =====
+	// ===== 读取 =====
 
-	/** 删除知识库条目（仅对插件自己上传的 media_id 调用） */
-	async delKnowledge(kbId: string, mediaIds: string[]): Promise<void> {
-		await this.post("/cgi-bin/knowledge/del_knowledge", {
-			knowledge_base_id: kbId,
-			media_ids: mediaIds,
+	/** 标签列表（客户端实际使用 search_tags） */
+	async getTags(kbId: string): Promise<{ tag: string }[]> {
+		const data = await this.post<{ searched_tags?: { tag_info?: { tag?: string } }[] }>(
+			`${READER}/search_tags`,
+			{ knowledge_base_id: kbId, query: "", cursor: "", limit: 50 },
+		);
+		return (data.searched_tags ?? []).map((t) => ({ tag: t.tag_info?.tag ?? "" })).filter((t) => t.tag);
+	}
+
+	/** 按标题搜索条目（用于把官方 media_id 解析为内部 media_id） */
+	async searchKnowledge(kbId: string, query: string): Promise<InternalKnowledge[]> {
+		const data = await this.post<{ searched_knowledge_list?: { knowledge?: Record<string, unknown> }[] }>(
+			`${READER}/search_knowledge`,
+			{ knowledge_base_id: kbId, query, cursor: "" },
+		);
+		return (data.searched_knowledge_list ?? []).map((x) => {
+			const k = (x.knowledge ?? {}) as Record<string, unknown>;
+			return {
+				media_id: String(k.media_id ?? ""),
+				media_type: Number(k.media_type ?? 0),
+				title: String(k.title ?? ""),
+				parent_folder_id: k.parent_folder_id ? String(k.parent_folder_id) : undefined,
+				tags: Array.isArray(k.tags) ? (k.tags as string[]) : undefined,
+			};
 		});
+	}
+
+	/** 读取知识库根目录列表 */
+	async listRoot(kbId: string): Promise<InternalKnowledge[]> {
+		const data = await this.post<{ knowledge_list?: Record<string, unknown>[] }>(
+			`${READER}/get_knowledge_base_home_page`,
+			{ knowledge_base_id: kbId, knowledge_list_req: { knowledge_base_id: kbId, folder_id: kbId, sort_type: 9, need_default_cover: false } },
+		);
+		return ((data.knowledge_list as Record<string, unknown>[]) ?? []).map((k) => ({
+			media_id: String(k.media_id ?? ""),
+			media_type: Number(k.media_type ?? 0),
+			title: String(k.title ?? ""),
+			parent_folder_id: k.parent_folder_id ? String(k.parent_folder_id) : undefined,
+		}));
+	}
+
+	// ===== 标签管理 =====
+
+	async updateTags(kbId: string, mediaId: string, tags: string[], folderId?: string, mediaType?: number): Promise<void> {
+		await this.post(`${WRITER}/update_tags`, {
+			knowledge_base_id: kbId,
+			media_id: mediaId,
+			...(folderId ? { folder_id: folderId } : {}),
+			...(mediaType !== undefined ? { media_type: mediaType } : {}),
+			tags,
+		});
+	}
+
+	async delTags(kbId: string, tags: string[]): Promise<void> {
+		await this.post(`${WRITER}/del_tags`, { knowledge_base_id: kbId, tags });
+	}
+
+	async renameTag(kbId: string, originTag: string, newTag: string): Promise<void> {
+		await this.post(`${WRITER}/rename_tag`, { knowledge_base_id: kbId, origin_tag: originTag, new_tag: newTag });
 	}
 
 	// ===== 修改 =====
 
-	/** 重命名知识条目标题 */
-	async renameKnowledge(params: {
-		kbId: string;
-		mediaId: string;
-		title: string;
-		folderId?: string;
-		mediaType?: number;
-	}): Promise<void> {
-		await this.post("/cgi-bin/knowledge/rename_knowledge", {
+	async renameKnowledge(params: { kbId: string; mediaId: string; title: string; folderId?: string; mediaType?: number }): Promise<void> {
+		await this.post(`${WRITER}/rename_knowledge`, {
 			knowledge_base_id: params.kbId,
 			media_id: params.mediaId,
 			title: params.title,
 			...(params.folderId ? { folder_id: params.folderId } : {}),
 			...(params.mediaType !== undefined ? { media_type: params.mediaType } : {}),
-		});
-	}
-
-	/** 替换知识条目内容：newMedia 需先经 create_media + COS 上传（复用官方流程） */
-	async replaceKnowledge(params: {
-		kbId: string;
-		originMediaId: string;
-		folderId?: string;
-		newMediaId: string;
-		newMediaType: number;
-		fileInfo: { contentType: string; cosKey: string; fileName: string; fileSize: number };
-	}): Promise<void> {
-		await this.post("/cgi-bin/knowledge/replace_knowledge", {
-			knowledge_base_id: params.kbId,
-			origin_media_id: params.originMediaId,
-			...(params.folderId ? { folder_id: params.folderId } : {}),
-			replace_info: {
-				media_id: params.newMediaId,
-				media_type: params.newMediaType,
-				file_info: {
-					content_type: params.fileInfo.contentType,
-					cos_key: params.fileInfo.cosKey,
-					file_name: params.fileInfo.fileName,
-					file_size: params.fileInfo.fileSize,
-				},
-			},
-		});
-	}
-
-	// ===== 标签管理 =====
-
-	/** 知识库标签列表（客户端 getTags 返回 tagInfos） */
-	async getTags(kbId: string): Promise<TagInfo[]> {
-		const data = await this.post<{ tagInfos?: { tag?: string; used_cnt?: number }[] }>(
-			"/cgi-bin/knowledge/get_tags",
-			{ knowledge_base_id: kbId },
-		);
-		return (data.tagInfos ?? []).map((t) => ({ tag: t.tag ?? "", count: t.used_cnt }));
-	}
-
-	/** 搜索标签（游标翻页） */
-	async searchTags(kbId: string, query: string, cursor = "", limit = 20): Promise<{ tags: string[]; nextCursor: string; isEnd: boolean }> {
-		const data = await this.post<{ searchedTags?: { tag?: string }[]; next_cursor?: string; is_end?: boolean }>(
-			"/cgi-bin/knowledge/search_tags",
-			{ knowledge_base_id: kbId, query, cursor, limit },
-		);
-		return {
-			tags: (data.searchedTags ?? []).map((t) => t.tag ?? ""),
-			nextCursor: String(data.next_cursor ?? ""),
-			isEnd: !!data.is_end,
-		};
-	}
-
-	/** 设置单个条目的标签（覆盖式） */
-	async updateTags(kbId: string, mediaId: string, tags: string[]): Promise<void> {
-		await this.post("/cgi-bin/knowledge/update_tags", {
-			knowledge_base_id: kbId,
-			media_id: mediaId,
-			tags,
-		});
-	}
-
-	/** 批量设置多个条目的标签；返回每条成败 */
-	async batchUpdateTags(kbId: string, mediaIds: string[], tags: string[]): Promise<{ success: string[]; fail: string[] }> {
-		const data = await this.post<{ results?: Record<string, { retCode?: number }> }>(
-			"/cgi-bin/knowledge/batch_update_tags",
-			{ knowledge_base_id: kbId, media_ids: mediaIds, tags },
-		);
-		const success: string[] = [];
-		const fail: string[] = [];
-		for (const [mediaId, r] of Object.entries(data.results ?? {})) {
-			(Number(r.retCode) === 0 ? success : fail).push(mediaId);
-		}
-		return { success, fail };
-	}
-
-	/** 删除知识库标签 */
-	async delTags(kbId: string, tags: string[]): Promise<void> {
-		await this.post("/cgi-bin/knowledge/del_tags", { knowledge_base_id: kbId, tags });
-	}
-
-	/** 重命名知识库标签 */
-	async renameTag(kbId: string, originTag: string, newTag: string): Promise<void> {
-		await this.post("/cgi-bin/knowledge/rename_tag", {
-			knowledge_base_id: kbId,
-			origin_tag: originTag,
-			new_tag: newTag,
+			action: 0,
+			is_searching: false,
 		});
 	}
 
 	// ===== 结构管理 =====
 
-	/** 在知识库中新建文件夹（parentFolderId 省略或传知识库 ID 表示根目录） */
-	async createFolder(kbId: string, parentFolderId: string, title: string): Promise<void> {
-		await this.post("/cgi-bin/knowledge/create_folder", {
+	async createFolder(kbId: string, parentFolderId: string, title: string): Promise<{ mediaId?: string }> {
+		const data = await this.post<{ knowledge?: { media_id?: string } }>(`${WRITER}/create_folder`, {
 			knowledge_base_id: kbId,
 			folder_id: parentFolderId || kbId,
 			title,
 		});
+		return { mediaId: (data.knowledge as { media_id?: string } | undefined)?.media_id };
 	}
 
-	/** 置顶/取消置顶条目 */
 	async setKnowledgeTop(kbId: string, folderId: string, mediaId: string, isTop: boolean): Promise<void> {
-		await this.post("/cgi-bin/knowledge/set_knowledge_top", {
+		await this.post(`${WRITER}/set_knowledge_top`, {
 			knowledge_base_id: kbId,
 			folder_id: folderId || kbId,
 			media_id: mediaId,
@@ -218,47 +198,110 @@ export class ImaCgiClient {
 		});
 	}
 
-	/** 创建知识库（个人类型按客户端默认字段构造；如失败请按服务端 msg 调整） */
-	async createKnowledgeBase(name: string, description = ""): Promise<{ id?: string }> {
-		return await this.post<{ id?: string }>("/cgi-bin/knowledge/create_knowledge_base", {
-			name,
-			...(description ? { description } : {}),
-			type: 1,
-		});
+	async createKnowledgeBase(name: string): Promise<{ id?: string }> {
+		const data = await this.post<{ info?: Record<string, unknown> }>(`${WRITER}/create_knowledge_base`, { name });
+		// info 内嵌 basic_info.id 或顶层 id，递归找不到则留空
+		const info = data.info as { id?: string; basic_info?: { id?: string } } | undefined;
+		return { id: info?.id ?? info?.basic_info?.id };
+	}
+
+	async deleteKnowledgeBase(id: string): Promise<void> {
+		await this.post(`${WRITER}/delete_knowledge_base`, { id });
+	}
+
+	// ===== 删除（文档与文件夹通用；仅对插件可控对象调用） =====
+
+	async delKnowledge(kbId: string, mediaIds: string[]): Promise<void> {
+		await this.post(`${WRITER}/del_knowledge`, { knowledge_base_id: kbId, media_ids: mediaIds });
 	}
 
 	// ===== 跨库复制 =====
 
-	/** 跨知识库复制条目（dstFolderId 省略为目标库根目录）；如服务端返回异步任务 ID，将包含在返回值中 */
-	async copyKnowledge(params: {
-		mediaIds: string[];
-		dstKbId: string;
-		dstFolderId?: string;
-	}): Promise<{ taskId?: string }> {
-		return await this.post<{ taskId?: string }>("/cgi-bin/knowledge/copy_knowledge", {
+	async copyKnowledge(params: { mediaIds: string[]; dstKbId: string; dstFolderId?: string }): Promise<{ mediaIds?: string[] }> {
+		const data = await this.post<{ media_ids?: string[] }>(`${WRITER}/copy_knowledge`, {
 			media_ids: params.mediaIds,
 			dst_knowledge_base_id: params.dstKbId,
 			...(params.dstFolderId ? { dst_folder_id: params.dstFolderId } : {}),
 		});
+		return { mediaIds: data.media_ids };
 	}
 
-	/** 取消跨库复制任务 */
 	async cancelCrossKbOp(taskId: string): Promise<void> {
-		await this.post("/cgi-bin/knowledge/cancel_cross_kb_op", { task_id: taskId });
+		await this.post(`${WRITER}/cancel_cross_kb_op`, { task_id: taskId });
 	}
 
-	/** 测试会话有效性（探测不存在的资源，不产生副作用） */
+	// ===== 内部上传链路（上传到内部命名空间，文档此后可改名/删除/打标签） =====
+
+	async uploadMarkdown(kbId: string, fileName: string, content: Uint8Array, folderId?: string): Promise<{ mediaId: string }> {
+		// 1) create_media 取 COS 凭证（media_type 为字符串枚举）
+		const cm = await this.post<{ cos_credential?: Record<string, string> }>(`${FILEMGR}/create_media`, {
+			knowledge_base_id: kbId,
+			file_name: fileName,
+			file_size: content.byteLength,
+			content_type: "text/markdown",
+			file_ext: "md",
+			media_type: "MARKDOWN",
+		});
+		const cred = cm.cos_credential;
+		if (!cred?.cos_key) throw new CgiError(-1, "create_media 未返回上传凭证");
+
+		// 2) COS PUT（签名算法与官方通道相同，已对拍验证）
+		await this.cosPut(content, cred, "text/markdown");
+
+		// 3) add_knowledge（服务端根据 cos_key 分配内部 media_id）
+		const ak = await this.post<{ media_id?: string }>(`${WRITER}/add_knowledge`, {
+			knowledge_base_id: kbId,
+			media_type: 7,
+			title: fileName,
+			...(folderId ? { folder_id: folderId } : {}),
+			file_info: {
+				cos_key: cred.cos_key,
+				file_size: content.byteLength,
+				last_modify_time: Math.floor(Date.now() / 1000),
+				file_name: fileName,
+			},
+		});
+		const mediaId = ak.media_id ?? "";
+		if (!mediaId) throw new CgiError(-1, "add_knowledge 未返回 media_id");
+		return { mediaId };
+	}
+
+	private async cosPut(content: Uint8Array, cred: Record<string, string>, contentType: string): Promise<void> {
+		// 纯 JS SHA-1/HMAC（无 Node 依赖）
+		const sig = await import("./cos").then((m) =>
+			m.buildCosAuthorization({
+				secretId: cred.secret_id,
+				secretKey: cred.secret_key,
+				pathname: `/${cred.cos_key}`,
+				host: `${cred.bucket_name}.cos.${cred.region}.myqcloud.com`,
+				contentLength: content.byteLength,
+				startTime: Number(cred.start_time),
+				expiredTime: Number(cred.expired_time),
+			}),
+		);
+		const res = await requestUrl({
+			url: `https://${cred.bucket_name}.cos.${cred.region}.myqcloud.com/${cred.cos_key}`,
+			method: "PUT",
+			headers: {
+				"Content-Type": contentType,
+				Authorization: sig,
+				"x-cos-security-token": cred.token,
+			},
+			body: content.buffer.slice(content.byteOffset, content.byteOffset + content.byteLength) as ArrayBuffer,
+			throw: false,
+		});
+		if (res.status < 200 || res.status >= 300) {
+			throw new CgiError(-1, `COS 上传失败（HTTP ${res.status}）`);
+		}
+	}
+
+	/** 会话有效性探测（不产生副作用） */
 	async probe(): Promise<{ ok: boolean; message: string }> {
 		try {
-			await this.delKnowledge("probe_kb_id", ["probe_media_id"]);
-			return { ok: true, message: "会话有效（探测请求返回正常）" };
+			await this.listRoot(this.uid);
+			return { ok: true, message: `会话有效（UID ${this.uid} 的知识库可访问）` };
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			if (/登录|login|auth|鉴权|权限|ticket|cookie|key/i.test(msg)) {
-				return { ok: false, message: `Cookie 无效或已过期：${msg}` };
-			}
-			// 业务错误（如"知识库不存在"）说明鉴权已通过
-			return { ok: true, message: `接口可达，会话有效（探测返回：${msg}）` };
+			return { ok: false, message: err instanceof Error ? err.message : String(err) };
 		}
 	}
 }
